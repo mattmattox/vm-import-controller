@@ -28,6 +28,9 @@ var _ = Describe("perform valid dns names", func() {
 		}
 
 		vcsim = &migration.VmwareSource{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "migration.harvesterhci.io/v1beta1",
+			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "local-vm-validation",
 				Namespace: "default",
@@ -78,11 +81,11 @@ var _ = Describe("perform valid dns names", func() {
 					return err
 				}
 
-				if vmObj.Status.Status == migration.VirtualMachineInvalid {
+				if vmObj.Status.Status == migration.VirtualMachineImportInvalid {
 					return nil
 				}
 
-				return fmt.Errorf("waiiting for vm obj to be marked invalid")
+				return fmt.Errorf("waiting for vm obj to be marked invalid")
 			}, "30s", "5s").ShouldNot(HaveOccurred())
 		})
 	})

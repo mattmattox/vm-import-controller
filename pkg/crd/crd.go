@@ -3,7 +3,7 @@ package crd
 import (
 	"context"
 
-	"github.com/rancher/wrangler/pkg/crd"
+	"github.com/rancher/wrangler/v3/pkg/crd"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
@@ -13,6 +13,10 @@ import (
 func List() []crd.CRD {
 	return []crd.CRD{
 		newCRD("migration.harvesterhci.io", &migration.VmwareSource{}, func(c crd.CRD) crd.CRD {
+			return c.
+				WithColumn("Status", ".status.status")
+		}),
+		newCRD("migration.harvesterhci.io", &migration.OvaSource{}, func(c crd.CRD) crd.CRD {
 			return c.
 				WithColumn("Status", ".status.status")
 		}),

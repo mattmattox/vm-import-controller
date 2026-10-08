@@ -9,35 +9,38 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumeactions"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v2/volumes"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/startstop"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/flavors"
-	"github.com/gophercloud/gophercloud/openstack/compute/v2/servers"
-	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/imagedata"
-	"github.com/gophercloud/gophercloud/openstack/imageservice/v2/images"
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v2/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/flavors"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/imagedata"
+	"github.com/gophercloud/gophercloud/v2/openstack/image/v2/images"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
+	"github.com/gophercloud/gophercloud/v2/openstack/utils"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	kubevirt "kubevirt.io/api/core/v1"
 
 	migration "github.com/harvester/vm-import-controller/pkg/apis/migration.harvesterhci.io/v1beta1"
-	"github.com/harvester/vm-import-controller/pkg/qemu"
 	"github.com/harvester/vm-import-controller/pkg/server"
+	"github.com/harvester/vm-import-controller/pkg/source"
+	"github.com/harvester/vm-import-controller/pkg/util"
 )
 
 const (
-	NotUniqueName   = "notUniqueName"
-	NotServerFound  = "noServerFound"
-	defaultInterval = 10 * time.Second
-	defaultCount    = 30
+	NotUniqueName         = "notUniqueName"
+	NotServerFound        = "noServerFound"
+	pollingTimeout        = 2 * 60 * 60 * time.Second
+	annotationDescription = "field.cattle.io/description"
+	computeMicroversion   = "2.19"
 )
 
 type Client struct {
@@ -47,10 +50,30 @@ type Client struct {
 	storageClient *gophercloud.ServiceClient
 	computeClient *gophercloud.ServiceClient
 	imageClient   *gophercloud.ServiceClient
+	networkClient *gophercloud.ServiceClient
+	options       migration.OpenstackSourceOptions
+}
+
+type ExtendedVolume struct {
+	VolumeImageMetadata map[string]string `json:"volume_image_metadata,omitempty"`
+}
+
+// ExtendedServer The original `Server` structure does not contain the `Description` field.
+// References:
+// - https://github.com/gophercloud/gophercloud/pull/1505
+// - https://docs.openstack.org/api-ref/compute/?expanded=list-all-metadata-detail%2Ccreate-server-detail#show-server-details
+type ExtendedServer struct {
+	servers.Server
+	ServerDescription
+}
+
+type ServerDescription struct {
+	// This requires microversion 2.19 or later.
+	Description string `json:"description"`
 }
 
 // NewClient will generate a GopherCloud client
-func NewClient(ctx context.Context, endpoint string, region string, secret *corev1.Secret) (*Client, error) {
+func NewClient(ctx context.Context, endpoint string, region string, secret *corev1.Secret, options migration.OpenstackSourceOptions) (*Client, error) {
 	username, ok := secret.Data["username"]
 	if !ok {
 		return nil, fmt.Errorf("no username provided in secret %s", secret.Name)
@@ -71,18 +94,18 @@ func NewClient(ctx context.Context, endpoint string, region string, secret *core
 		return nil, fmt.Errorf("no domain_name provided in secret %s", secret.Name)
 	}
 
-	config := &tls.Config{}
+	tlsClientConfig := &tls.Config{}
 
 	customCA, ok := secret.Data["ca_cert"]
 	if ok {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(customCA)
-		config.RootCAs = caCertPool
+		tlsClientConfig.RootCAs = caCertPool
 	} else {
-		config.InsecureSkipVerify = true
+		tlsClientConfig.InsecureSkipVerify = true
 	}
 
-	tr := &http.Transport{TLSClientConfig: config}
+	tr := &http.Transport{TLSClientConfig: tlsClientConfig}
 
 	authOpts := gophercloud.AuthOptions{
 		IdentityEndpoint: endpoint,
@@ -101,7 +124,7 @@ func NewClient(ctx context.Context, endpoint string, region string, secret *core
 		return nil, fmt.Errorf("error generating new client: %v", err)
 	}
 	client.HTTPClient.Transport = tr
-	err = openstack.Authenticate(client, authOpts)
+	err = openstack.Authenticate(ctx, client, authOpts)
 	if err != nil {
 		return nil, fmt.Errorf("error authenticated client: %v", err)
 	}
@@ -116,10 +139,33 @@ func NewClient(ctx context.Context, endpoint string, region string, secret *core
 		return nil, fmt.Errorf("error generating compute client: %v", err)
 	}
 
-	imageClient, err := openstack.NewImageServiceV2(client, endPointOpts)
+	// Try to set the `compute` microversion to 2.19 to get the server description.
+	// https://docs.openstack.org/nova/latest/reference/api-microversion-history.html
+	supportedMicroversions, err := utils.GetSupportedMicroversions(ctx, computeClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch supported microversions from compute client: %v", err)
+	}
+	supported, err := supportedMicroversions.IsSupported(computeMicroversion)
+	if err == nil && supported {
+		logrus.WithFields(logrus.Fields{
+			"type":            computeClient.Type,
+			"minMicroversion": fmt.Sprintf("%d.%d", supportedMicroversions.MinMajor, supportedMicroversions.MinMinor),
+			"maxMicroversion": fmt.Sprintf("%d.%d", supportedMicroversions.MaxMajor, supportedMicroversions.MaxMinor),
+			"microversion":    computeMicroversion,
+		}).Debug("Setting custom microversion")
+		computeClient.Microversion = computeMicroversion
+	}
+
+	imageClient, err := openstack.NewImageV2(client, endPointOpts)
 	if err != nil {
 		return nil, fmt.Errorf("error generating image client: %v", err)
 	}
+
+	networkClient, err := openstack.NewNetworkV2(client, endPointOpts)
+	if err != nil {
+		return nil, fmt.Errorf("error generating network client: %v", err)
+	}
+
 	return &Client{
 		ctx:           ctx,
 		pClient:       client,
@@ -127,19 +173,16 @@ func NewClient(ctx context.Context, endpoint string, region string, secret *core
 		storageClient: storageClient,
 		computeClient: computeClient,
 		imageClient:   imageClient,
+		networkClient: networkClient,
+		options:       options,
 	}, nil
 }
 
 func (c *Client) Verify() error {
-	computeClient, err := openstack.NewComputeV2(c.pClient, c.opts)
+	pg := servers.List(c.computeClient, servers.ListOpts{})
+	allPg, err := pg.AllPages(c.ctx)
 	if err != nil {
-		return fmt.Errorf("error generating compute client during verify phase :%v", err)
-	}
-
-	pg := servers.List(computeClient, servers.ListOpts{})
-	allPg, err := pg.AllPages()
-	if err != nil {
-		return fmt.Errorf("error generating all pages :%v", err)
+		return fmt.Errorf("error generating all pages: %v", err)
 	}
 
 	ok, err := allPg.IsEmpty()
@@ -153,10 +196,44 @@ func (c *Client) Verify() error {
 
 	allServers, err := servers.ExtractServers(allPg)
 	if err != nil {
-		return fmt.Errorf("error extracting servers :%v", err)
+		return fmt.Errorf("error extracting servers: %v", err)
 	}
 
 	logrus.Infof("found %d servers", len(allServers))
+	return nil
+}
+
+func (c *Client) PreFlightChecks(vm *migration.VirtualMachineImport) (err error) {
+	if ptr.Deref(vm.Spec.ForcePowerOff, false) {
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+		}).Warn("A forced power off is not supported by OpenStack; ignoring the 'ForcePowerOff' setting")
+	}
+
+	// Check the source network mappings.
+	for _, nm := range vm.Spec.Mapping {
+		logrus.WithFields(logrus.Fields{
+			"name":          vm.Name,
+			"namespace":     vm.Namespace,
+			"sourceNetwork": nm.SourceNetwork,
+		}).Info("Checking the source network as part of the preflight checks")
+
+		pgr := networks.List(c.networkClient, networks.ListOpts{Name: nm.SourceNetwork})
+		allPgs, err := pgr.AllPages(c.ctx)
+		if err != nil {
+			return fmt.Errorf("error while generating all pages during querying source network '%s': %v", nm.SourceNetwork, err)
+		}
+		ok, err := allPgs.IsEmpty()
+		if err != nil {
+			return fmt.Errorf("error while checking if pages were empty during querying source network '%s': %v", nm.SourceNetwork, err)
+		}
+		if ok {
+			return fmt.Errorf("source network '%s' not found", nm.SourceNetwork)
+		}
+	}
+
 	return nil
 }
 
@@ -166,136 +243,240 @@ func (c *Client) ExportVirtualMachine(vm *migration.VirtualMachineImport) error 
 		return err
 	}
 
-	tmpDir, err := os.MkdirTemp("/tmp", "openstack-image-")
-	if err != nil {
-		return fmt.Errorf("error creating tmp image directory: %v", err)
-	}
+	logrus.WithFields(util.FieldsToJSON(logrus.Fields{
+		"name":      vm.Name,
+		"namespace": vm.Namespace,
+		"spec":      vmObj.AttachedVolumes,
+	}, []string{"spec"})).Info("Origin spec of the volumes to be imported")
 
-	for i, v := range vmObj.AttachedVolumes {
+	// Helper function to do the export.
+	// This is necessary so that the defer functions are executed at the right
+	// time.
+	exportFn := func(index int, av servers.AttachedVolume) error {
+		var snapshot *snapshots.Snapshot
+		var volume *volumes.Volume
+		var volumeImage volumes.VolumeImage
+
+		imageName := fmt.Sprintf("import-controller-%s-%d", vm.Spec.VirtualMachineName, index)
+
+		// Make sure the snapshot, volume and volume image are cleaned up in any case.
+		defer func() {
+			logrus.WithFields(logrus.Fields{
+				"name":                    vm.Name,
+				"namespace":               vm.Namespace,
+				"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+				"snapshot.id":             ptr.Deref(snapshot, snapshots.Snapshot{}).ID,
+				"volume.id":               ptr.Deref(volume, volumes.Volume{}).ID,
+				"volumeImage.imageID":     volumeImage.ImageID,
+			}).Info("Cleaning up resources on OpenStack source")
+
+			if len(volumeImage.ImageID) > 0 {
+				if err := images.Delete(c.ctx, c.imageClient, volumeImage.ImageID).ExtractErr(); err != nil {
+					logrus.WithFields(logrus.Fields{
+						"name":                    vm.Name,
+						"namespace":               vm.Namespace,
+						"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+						"image.id":                volumeImage.ImageID,
+					}).Errorf("Failed to delete image: %v", err)
+				}
+			}
+
+			if volume != nil {
+				if err := volumes.Delete(c.ctx, c.storageClient, volume.ID, volumes.DeleteOpts{}).ExtractErr(); err != nil {
+					logrus.WithFields(logrus.Fields{
+						"name":                    vm.Name,
+						"namespace":               vm.Namespace,
+						"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+						"volume.id":               volume.ID,
+					}).Errorf("Failed to delete volume: %v", err)
+				}
+			}
+
+			if snapshot != nil {
+				if err := snapshots.Delete(c.ctx, c.storageClient, snapshot.ID).ExtractErr(); err != nil {
+					logrus.WithFields(logrus.Fields{
+						"name":                    vm.Name,
+						"namespace":               vm.Namespace,
+						"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+						"snapshot.id":             snapshot.ID,
+						"snapshot.name":           snapshot.Name,
+						"snapshot.volumeID":       snapshot.VolumeID,
+					}).Errorf("Failed to delete snapshot: %v", err)
+				}
+			}
+		}()
+
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"opts.name":               imageName,
+			"opts.volumeID":           av.ID,
+		}).Info("Creating a new snapshot")
+
 		// create snapshot for volume
-		snapInfo, err := snapshots.Create(c.storageClient, snapshots.CreateOpts{
-			Name:     fmt.Sprintf("import-controller-%v-%d", vm.Spec.VirtualMachineName, i),
-			VolumeID: v.ID,
+		snapshot, err = snapshots.Create(c.ctx, c.storageClient, snapshots.CreateOpts{
+			Name:     imageName,
+			VolumeID: av.ID,
 			Force:    true,
 		}).Extract()
-
 		// snapshot creation is async, so call returns a 202 error when successful.
 		// this is ignored
 		if err != nil {
 			return err
 		}
 
-		for i := 0; i < defaultCount; i++ {
-			snapObj, err := snapshots.Get(c.storageClient, snapInfo.ID).Extract()
-			if err != nil {
-				return err
-			}
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"snapshot.id":             snapshot.ID,
+			"snapshot.name":           snapshot.Name,
+			"snapshot.volumeID":       snapshot.VolumeID,
+			"snapshot.size":           snapshot.Size,
+		}).Info("Waiting for snapshot to be available")
 
-			if snapObj.Status == "available" {
-				break
-			}
-			time.Sleep(defaultInterval)
+		ctxWithTimeout1, cancel1 := context.WithTimeout(c.ctx, pollingTimeout)
+		defer cancel1()
+
+		if err := snapshots.WaitForStatus(ctxWithTimeout1, c.storageClient, snapshot.ID, "available"); err != nil {
+			return fmt.Errorf("timeout waiting for snapshot %s to be available: %w", snapshot.ID, err)
 		}
 
-		volObj, err := volumes.Create(c.storageClient, volumes.CreateOpts{
-			SnapshotID: snapInfo.ID,
-			Size:       snapInfo.Size,
-		}).Extract()
+		volume, err = volumes.Create(c.ctx, c.storageClient, volumes.CreateOpts{
+			SnapshotID: snapshot.ID,
+			Size:       snapshot.Size,
+		}, nil).Extract()
 		if err != nil {
 			return err
 		}
 
-		logrus.Info(volObj)
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"volume.id":               volume.ID,
+			"volume.createdAt":        volume.CreatedAt,
+			"volume.snapshotID":       volume.SnapshotID,
+			"volume.size":             volume.Size,
+			"volume.status":           volume.Status,
+			"retryCount":              c.options.UploadImageRetryCount,
+			"retryDelay":              c.options.UploadImageRetryDelay,
+		}).Info("Waiting for volume to be available ...")
 
-		for i := 0; i < defaultCount; i++ {
-			tmpVolObj, err := volumes.Get(c.storageClient, volObj.ID).Extract()
-			if err != nil {
-				return err
-			}
-			if tmpVolObj.Status == "available" {
-				break
-			}
-			time.Sleep(defaultInterval)
+		ctxWithTimeout2, cancel2 := context.WithTimeout(c.ctx, pollingTimeout)
+		defer cancel2()
+
+		if err := volumes.WaitForStatus(ctxWithTimeout2, c.storageClient, volume.ID, "available"); err != nil {
+			return fmt.Errorf("timeout waiting for volume %s to be available: %w", volume.ID, err)
 		}
 
-		logrus.Info("attempting to create new image from volume")
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"volume.id":               volume.ID,
+			"opts.imagename":          imageName,
+		}).Info("Creating a new image from a volume")
 
-		volImage, err := volumeactions.UploadImage(c.storageClient, volObj.ID, volumeactions.UploadImageOpts{
-			ImageName:  fmt.Sprintf("import-controller-%s-%d", vm.Spec.VirtualMachineName, i),
-			DiskFormat: "qcow2",
+		volumeImage, err = volumes.UploadImage(c.ctx, c.storageClient, volume.ID, volumes.UploadImageOpts{
+			ImageName:  imageName,
+			DiskFormat: "raw",
 		}).Extract()
-
 		if err != nil {
-			return err
+			return fmt.Errorf("error while uploading image: %w", err)
 		}
+
 		// wait for image to be ready
-		for i := 0; i < defaultCount; i++ {
-			imgObj, err := images.Get(c.imageClient, volImage.ImageID).Extract()
+		isImageActive := false
+		for i := 0; i < c.options.UploadImageRetryCount; i++ {
+			logrus.WithFields(logrus.Fields{
+				"name":                    vm.Name,
+				"namespace":               vm.Namespace,
+				"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+				"retryCount":              c.options.UploadImageRetryCount,
+				"retryDelay":              c.options.UploadImageRetryDelay,
+				"retryIndex":              i,
+			}).Infof("Waiting for image status to be %q ...", images.ImageStatusActive)
+
+			imgObj, err := images.Get(c.ctx, c.imageClient, volumeImage.ImageID).Extract()
 			if err != nil {
-				return fmt.Errorf("error checking status of volume image: %v", err)
+				logrus.WithFields(logrus.Fields{
+					"name":                    vm.Name,
+					"namespace":               vm.Namespace,
+					"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+					"image.id":                volumeImage.ImageID,
+				}).Errorf("Failed to get image. Retrying: %v", err)
+			} else {
+				logrus.WithFields(logrus.Fields{
+					"name":                    vm.Name,
+					"namespace":               vm.Namespace,
+					"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+					"image.id":                imgObj.ID,
+					"image.status":            imgObj.Status,
+				}).Info("Image has been uploaded. Checking status ...")
+
+				if imgObj.Status == images.ImageStatusActive {
+					isImageActive = true
+					break
+				}
 			}
-			if imgObj.Status == "active" {
-				break
-			}
-			time.Sleep(defaultInterval)
+
+			time.Sleep(time.Duration(c.options.UploadImageRetryDelay) * time.Second)
+		}
+		if !isImageActive {
+			return fmt.Errorf("timeout waiting for status %q of image %s", images.ImageStatusActive, volumeImage.ImageID)
 		}
 
-		contents, err := imagedata.Download(c.imageClient, volImage.ImageID).Extract()
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"imageID":                 volumeImage.ImageID,
+		}).Info("Downloading an image")
+
+		contents, err := imagedata.Download(c.ctx, c.imageClient, volumeImage.ImageID).Extract()
 		if err != nil {
-			return err
+			return fmt.Errorf("error downloading image %s: %w", volumeImage.ImageID, err)
 		}
 
-		imageContents, err := io.ReadAll(contents)
+		rawImageFileName := generateRawImageFileName(vm.Status.ImportedVirtualMachineName, index)
+
+		logrus.WithFields(logrus.Fields{
+			"name":                    vm.Name,
+			"namespace":               vm.Namespace,
+			"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+			"volume.imageID":          volumeImage.ImageID,
+			"rawImageFileName":        rawImageFileName,
+		}).Info("Downloading RAW image")
+
+		err = writeRawImageFile(filepath.Join(server.TempDir(), rawImageFileName), contents)
 		if err != nil {
-			return err
-		}
-
-		qcowFileName := filepath.Join(tmpDir, fmt.Sprintf("%s-%d", vm.Spec.VirtualMachineName, i))
-		imgFile, err := os.Create(qcowFileName)
-		if err != nil {
-			return fmt.Errorf("error creating disk file: %v", err)
-		}
-
-		_, err = imgFile.Write(imageContents)
-		if err != nil {
-			return err
-		}
-		imgFile.Close()
-
-		// downloaded image is qcow2. Convert to raw file
-		rawFileName := filepath.Join(server.TempDir(), fmt.Sprintf("%s-%d.img", vmObj.Name, i))
-		err = qemu.ConvertQCOW2toRAW(qcowFileName, rawFileName)
-		if err != nil {
-			return fmt.Errorf("error converting qcow2 to raw file: %v", err)
-		}
-
-		if err := volumes.Delete(c.storageClient, volObj.ID, volumes.DeleteOpts{}).ExtractErr(); err != nil {
-			return fmt.Errorf("error deleting volume %s: %v", volObj.ID, err)
-		}
-
-		if err := snapshots.Delete(c.storageClient, snapInfo.ID).ExtractErr(); err != nil {
-			return fmt.Errorf("error deleting snapshot %s: %v", snapInfo.ID, err)
-		}
-
-		if err := images.Delete(c.imageClient, volImage.ImageID).ExtractErr(); err != nil {
-			return fmt.Errorf("error deleting image %s: %v", volImage.ImageID, err)
+			return fmt.Errorf("error downloading RAW image %s: %w", rawImageFileName, err)
 		}
 
 		vm.Status.DiskImportStatus = append(vm.Status.DiskImportStatus, migration.DiskInfo{
-			Name:          fmt.Sprintf("%s-%d.img", vmObj.Name, i),
-			DiskSize:      int64(volObj.Size),
+			Name:          rawImageFileName,
+			DiskSize:      int64(volume.Size),
 			DiskLocalPath: server.TempDir(),
+			BusType:       vm.GetDefaultDiskBusType(),
 		})
+
+		return nil
 	}
-	return os.RemoveAll(tmpDir)
+
+	for index, av := range vmObj.AttachedVolumes {
+		err := exportFn(index, av)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (c *Client) PowerOffVirtualMachine(vm *migration.VirtualMachineImport) error {
-	computeClient, err := openstack.NewComputeV2(c.pClient, c.opts)
-	if err != nil {
-		return fmt.Errorf("error generating compute client during poweroffvirtualmachine: %v", err)
-	}
-	uuid, err := c.checkOrGetUUID(vm.Spec.VirtualMachineName)
+func (c *Client) ShutdownGuest(vm *migration.VirtualMachineImport) error {
+	serverUUID, err := c.checkOrGetUUID(vm.Spec.VirtualMachineName)
 	if err != nil {
 		return err
 	}
@@ -305,13 +486,26 @@ func (c *Client) PowerOffVirtualMachine(vm *migration.VirtualMachineImport) erro
 		return err
 	}
 	if !ok {
-		return startstop.Stop(computeClient, uuid).ExtractErr()
+		return servers.Stop(c.ctx, c.computeClient, serverUUID).ExtractErr()
 	}
 	return nil
 }
 
-func (c *Client) IsPoweredOff(vm *migration.VirtualMachineImport) (bool, error) {
+// PowerOff should never be called for OpenStack but must be implemented due
+// to the interface specification.
+func (c *Client) PowerOff(_ *migration.VirtualMachineImport) error {
+	// Explicitly powering off a VM is not supported by the OpenStack API.
+	// Instead, the OpenStack's stop command attempts a graceful shutdown
+	// via ACPI, falling back to a forced shutdown if the guest OS does not
+	// shut down within a configured timeout.
+	return fmt.Errorf("powering off is not supported by OpenStack")
+}
 
+func (c *Client) IsPowerOffSupported() bool {
+	return false
+}
+
+func (c *Client) IsPoweredOff(vm *migration.VirtualMachineImport) (bool, error) {
 	s, err := c.findVM(vm.Spec.VirtualMachineName)
 	if err != nil {
 		return false, err
@@ -327,116 +521,74 @@ func (c *Client) IsPoweredOff(vm *migration.VirtualMachineImport) (bool, error) 
 func (c *Client) GenerateVirtualMachine(vm *migration.VirtualMachineImport) (*kubevirt.VirtualMachine, error) {
 	vmObj, err := c.findVM(vm.Spec.VirtualMachineName)
 	if err != nil {
-		return nil, fmt.Errorf("error finding vm in generatevirtualmachine: %v", err)
+		return nil, fmt.Errorf("error finding VM in GenerateVirtualMachine: %v", err)
 	}
 
-	flavorObj, err := flavors.Get(c.computeClient, vmObj.Flavor["id"].(string)).Extract()
+	// Log the origin VM specification for better troubleshooting.
+	// Note, JSON is used to be able to prettify the output for better readability.
+	logrus.WithFields(util.FieldsToJSON(logrus.Fields{
+		"name":      vm.Name,
+		"namespace": vm.Namespace,
+		"spec":      vmObj,
+	}, []string{"spec"})).Info("Origin spec of the VM to be imported")
+
+	flavorObj, err := flavors.Get(c.ctx, c.computeClient, vmObj.Flavor["id"].(string)).Extract()
 	if err != nil {
-		return nil, fmt.Errorf("error looking up flavor: %v", err)
+		return nil, fmt.Errorf("error looking up flavor: %w", err)
 	}
 
-	var networks []networkInfo
-	for network, values := range vmObj.Addresses {
-		valArr, ok := values.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("error asserting interface []interface")
-		}
-		for _, v := range valArr {
-			valMap, ok := v.(map[string]interface{})
-			if !ok {
-				return nil, fmt.Errorf("error asserting network array element into map[string]string")
-			}
-			networks = append(networks, networkInfo{
-				NetworkName: network,
-				MAC:         valMap["OS-EXT-IPS-MAC:mac_addr"].(string),
-			})
-		}
+	fw, err := c.getFirmwareSettings(&vmObj.Server)
+	if err != nil {
+		return nil, fmt.Errorf("error getting firware settings: %w", err)
 	}
+
+	networkInfos, err := generateNetworkInfos(vmObj.Addresses, vm.GetDefaultNetworkInterfaceModel())
+	if err != nil {
+		return nil, err
+	}
+
 	newVM := &kubevirt.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      vm.Spec.VirtualMachineName,
+			Name:      vm.Status.ImportedVirtualMachineName,
 			Namespace: vm.Namespace,
 		},
 	}
 
-	vmSpec := kubevirt.VirtualMachineSpec{
-		RunStrategy: &[]kubevirt.VirtualMachineRunStrategy{kubevirt.RunStrategyRerunOnFailure}[0],
-		Template: &kubevirt.VirtualMachineInstanceTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{
-					"harvesterhci.io/vmName": vm.Spec.VirtualMachineName,
-				},
-			},
-			Spec: kubevirt.VirtualMachineInstanceSpec{
-				Domain: kubevirt.DomainSpec{
-					CPU: &kubevirt.CPU{
-						Cores:   uint32(flavorObj.VCPUs),
-						Sockets: uint32(1),
-						Threads: 1,
-					},
-					Memory: &kubevirt.Memory{
-						Guest: &[]resource.Quantity{resource.MustParse(fmt.Sprintf("%dM", flavorObj.RAM))}[0],
-					},
-					Resources: kubevirt.ResourceRequirements{
-						Limits: corev1.ResourceList{
-							corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dM", flavorObj.RAM)),
-							corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", flavorObj.VCPUs)),
-						},
-					},
-				},
-			},
+	if vmObj.Description != "" {
+		if newVM.Annotations == nil {
+			newVM.Annotations = make(map[string]string)
+		}
+		newVM.Annotations[annotationDescription] = vmObj.Description
+	}
+
+	vmSpec := source.NewVirtualMachineSpec(source.VirtualMachineSpecConfig{
+		Name: vm.Status.ImportedVirtualMachineName,
+		Hardware: source.Hardware{
+			NumCPU:            uint32(flavorObj.VCPUs), // nolint:gosec
+			NumCoresPerSocket: 1,
+			MemoryMB:          int64(flavorObj.RAM), // nolint:gosec
 		},
-	}
+	})
 
-	mappedNetwork := mapNetworkCards(networks, vm.Spec.Mapping)
-	networkConfig := make([]kubevirt.Network, 0, len(mappedNetwork))
-	for i, v := range mappedNetwork {
-		networkConfig = append(networkConfig, kubevirt.Network{
-			NetworkSource: kubevirt.NetworkSource{
-				Multus: &kubevirt.MultusNetwork{
-					NetworkName: v.MappedNetwork,
-				},
-			},
-			Name: fmt.Sprintf("migrated-%d", i),
-		})
-	}
+	mappedNetwork := source.MapNetworks(networkInfos, vm.Spec.Mapping)
+	networkConfig, interfaceConfig := source.GenerateNetworkInterfaceConfigs(mappedNetwork, vm.GetDefaultNetworkInterfaceModel())
 
-	interfaces := make([]kubevirt.Interface, 0, len(mappedNetwork))
-	for i, v := range mappedNetwork {
-		interfaces = append(interfaces, kubevirt.Interface{
-			Name:       fmt.Sprintf("migrated-%d", i),
-			MacAddress: v.MAC,
-			Model:      "virtio",
-			InterfaceBindingMethod: kubevirt.InterfaceBindingMethod{
-				Bridge: &kubevirt.InterfaceBridge{},
-			},
-		})
-	}
-	// if there is no network, attach to Pod network. Essential for VM to be booted up
-	if len(networkConfig) == 0 {
-		networkConfig = append(networkConfig, kubevirt.Network{
-			Name: "pod-network",
-			NetworkSource: kubevirt.NetworkSource{
-				Pod: &kubevirt.PodNetwork{},
-			},
-		})
-		interfaces = append(interfaces, kubevirt.Interface{
-			Name:  "pod-network",
-			Model: "virtio",
-			InterfaceBindingMethod: kubevirt.InterfaceBindingMethod{
-				Masquerade: &kubevirt.InterfaceMasquerade{},
-			},
-		})
-	}
+	// Setup BIOS/EFI, SecureBoot and TPM settings.
+	source.ApplyFirmwareSettings(vmSpec, fw)
 
 	vmSpec.Template.Spec.Networks = networkConfig
-	vmSpec.Template.Spec.Domain.Devices.Interfaces = interfaces
-	newVM.Spec = vmSpec
+	vmSpec.Template.Spec.Domain.Devices.Interfaces = interfaceConfig
+	newVM.Spec = *vmSpec
+
 	// disk attachment needs query by core controller for storage classes, so will be added by the migration controller
 	return newVM, nil
 }
 
-// SetupOpenStackSecretFromEnv is a helper function to ease with testing
+func (c *Client) Cleanup(vm *migration.VirtualMachineImport) error {
+	return source.RemoveTempImageFiles(vm.Status.DiskImportStatus)
+}
+
+// SetupOpenstackSecretFromEnv is a helper function to ease with testing
 func SetupOpenstackSecretFromEnv(name string) (*corev1.Secret, error) {
 	s := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -509,7 +661,7 @@ func (c *Client) checkOrGetUUID(input string) (string, error) {
 	}*/
 
 	pg := servers.List(c.computeClient, servers.ListOpts{Name: input})
-	allPg, err := pg.AllPages()
+	allPg, err := pg.AllPages(c.ctx)
 	if err != nil {
 		return "", fmt.Errorf("error generating all pages in checkorgetuuid :%v", err)
 	}
@@ -520,7 +672,7 @@ func (c *Client) checkOrGetUUID(input string) (string, error) {
 	}
 
 	if ok {
-		return "", fmt.Errorf(NotServerFound)
+		return "", fmt.Errorf("%s: %s", NotServerFound, input)
 	}
 
 	allServers, err := servers.ExtractServers(allPg)
@@ -528,38 +680,151 @@ func (c *Client) checkOrGetUUID(input string) (string, error) {
 		return "", fmt.Errorf("error extracting servers in checkorgetuuid:%v", err)
 	}
 
-	if len(allServers) > 1 {
-		return "", fmt.Errorf(NotUniqueName)
+	// api could return multiple servers matching the pattern of name
+	// eg server names test and testvm will match name search "test"
+	// in which case we need to filter on actual name
+	var filteredServers []servers.Server
+	for _, v := range allServers {
+		if v.Name == input {
+			filteredServers = append(filteredServers, v)
+		}
 	}
 
-	return allServers[0].ID, nil
+	if len(filteredServers) > 1 {
+		return "", fmt.Errorf("%s: %s", NotUniqueName, input)
+	}
+	return filteredServers[0].ID, nil
 }
 
-func (c *Client) findVM(name string) (*servers.Server, error) {
+func (c *Client) findVM(name string) (*ExtendedServer, error) {
 	parsedUUID, err := c.checkOrGetUUID(name)
 	if err != nil {
 		return nil, err
 	}
-	return servers.Get(c.computeClient, parsedUUID).Extract()
+	sr := servers.Get(c.ctx, c.computeClient, parsedUUID)
 
+	var s ExtendedServer
+	err = sr.ExtractInto(&s)
+
+	return &s, err
 }
 
-type networkInfo struct {
-	NetworkName   string
-	MAC           string
-	MappedNetwork string
-}
+func (c *Client) getFirmwareSettings(instance *servers.Server) (*source.Firmware, error) {
+	var imageID string
 
-func mapNetworkCards(networkCards []networkInfo, mapping []migration.NetworkMapping) []networkInfo {
-	var retNetwork []networkInfo
-	for _, nc := range networkCards {
-		for _, m := range mapping {
-			if m.SourceNetwork == nc.NetworkName {
-				nc.MappedNetwork = m.DestinationNetwork
-				retNetwork = append(retNetwork, nc)
+	for _, v := range instance.AttachedVolumes {
+		resp := volumes.Get(c.ctx, c.storageClient, v.ID)
+		var volInfo volumes.Volume
+		if err := resp.ExtractIntoStructPtr(&volInfo, "volume"); err != nil {
+			return nil, fmt.Errorf("error extracting volume info for volume %s: %v", v.ID, err)
+		}
+
+		if volInfo.Bootable == "true" {
+			var volStatus ExtendedVolume
+			if err := resp.ExtractIntoStructPtr(&volStatus, "volume"); err != nil {
+				return nil, fmt.Errorf("error extracting volume status for volume %s: %v", v.ID, err)
 			}
+			imageID = volStatus.VolumeImageMetadata["image_id"]
 		}
 	}
 
-	return retNetwork
+	imageInfo, err := images.Get(c.ctx, c.imageClient, imageID).Extract()
+	if err != nil {
+		return nil, fmt.Errorf("error getting image details for image %s: %v", imageID, err)
+	}
+
+	fw := source.NewFirmware(false, false, false)
+
+	firmwareType, ok := imageInfo.Properties["hw_firmware_type"]
+	if ok && firmwareType.(string) == "uefi" {
+		fw.UEFI = true
+	}
+	logrus.Debugf("found image firmware settings %v", imageInfo.Properties)
+	if _, ok := imageInfo.Properties["hw_tpm_model"]; ok {
+		fw.TPM = true
+	}
+
+	if val, ok := imageInfo.Properties["os_secure_boot"]; ok && (val == "required" || val == "optional") {
+		fw.SecureBoot = true
+	}
+
+	return fw, nil
+}
+
+func generateNetworkInfos(info map[string]interface{}, defaultInterfaceModel string) ([]source.NetworkInfo, error) {
+	networkInfos := make([]source.NetworkInfo, 0)
+	uniqueNetworks := make([]source.NetworkInfo, 0)
+
+	for network, values := range info {
+		valArr, ok := values.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("error asserting interface []interface")
+		}
+		for _, v := range valArr {
+			valMap, ok := v.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("error asserting network array element into map[string]string")
+			}
+			networkInfos = append(networkInfos, source.NetworkInfo{
+				NetworkName: network,
+				MAC:         valMap["OS-EXT-IPS-MAC:mac_addr"].(string),
+				// Note, the interface model is not provided via the OpenStack
+				// Nova API, therefore we need to set it ourselves.
+				Model: defaultInterfaceModel,
+			})
+		}
+	}
+
+	// in case of interfaces with ipv6 and ipv4 addresses they are reported twice, so we need to dedup them
+	// based on a mac address
+	networksMap := make(map[string]source.NetworkInfo)
+	for _, v := range networkInfos {
+		networksMap[v.MAC] = v
+	}
+
+	for _, v := range networksMap {
+		uniqueNetworks = append(uniqueNetworks, v)
+	}
+
+	return uniqueNetworks, nil
+}
+
+// SanitizeVirtualMachineImport is used to sanitize the VirtualMachineImport object.
+func (c *Client) SanitizeVirtualMachineImport(vm *migration.VirtualMachineImport) error {
+	// If the given `spec.virtualMachineName` is a UUID, then we need to
+	// get the name from the OpenStack server object.
+	parsedUUID, err := uuid.Parse(vm.Spec.VirtualMachineName)
+	if err == nil {
+		vmObj, err := c.findVM(parsedUUID.String())
+		if err != nil {
+			return err
+		}
+		vm.Status.ImportedVirtualMachineName = vmObj.Name
+	} else {
+		vm.Status.ImportedVirtualMachineName = vm.Spec.VirtualMachineName
+	}
+
+	// Note, server objects might have upper case characters in OpenStack,
+	// so we need to convert them to lower case to be RFC 1123 compliant.
+	vm.Status.ImportedVirtualMachineName = strings.ToLower(vm.Status.ImportedVirtualMachineName)
+
+	return nil
+}
+
+// writeRawImageFile Download and write the raw image file to the specified path in chunks of 32KiB.
+func writeRawImageFile(name string, src io.ReadCloser) error {
+	dst, err := os.Create(name)
+	if err != nil {
+		return fmt.Errorf("error creating raw image file: %v", err)
+	}
+
+	defer dst.Close() //nolint:errcheck
+
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+// generateRawImageFileName Generate the raw image file name based on the VM name and index of the attached volume.
+func generateRawImageFileName(vmName string, index int) string {
+	return fmt.Sprintf("%s-%d.img", vmName, index)
 }

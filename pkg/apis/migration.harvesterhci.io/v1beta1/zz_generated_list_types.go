@@ -1,5 +1,5 @@
 /*
-Copyright 2022 Rancher Labs, Inc.
+Copyright 2026 SUSE, LLC.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,6 +36,23 @@ type OpenstackSourceList struct {
 
 func NewOpenstackSource(namespace, name string, obj OpenstackSource) *OpenstackSource {
 	obj.APIVersion, obj.Kind = SchemeGroupVersion.WithKind("OpenstackSource").ToAPIVersionAndKind()
+	obj.Name = name
+	obj.Namespace = namespace
+	return &obj
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// OvaSourceList is a list of OvaSource resources
+type OvaSourceList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []OvaSource `json:"items"`
+}
+
+func NewOvaSource(namespace, name string, obj OvaSource) *OvaSource {
+	obj.APIVersion, obj.Kind = SchemeGroupVersion.WithKind("OvaSource").ToAPIVersionAndKind()
 	obj.Name = name
 	obj.Namespace = namespace
 	return &obj

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -14,36 +15,40 @@ import (
 	"github.com/vmware/govmomi/nfc"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/session"
+	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	kubevirt "kubevirt.io/api/core/v1"
 
 	migration "github.com/harvester/vm-import-controller/pkg/apis/migration.harvesterhci.io/v1beta1"
 	"github.com/harvester/vm-import-controller/pkg/qemu"
 	"github.com/harvester/vm-import-controller/pkg/server"
+	"github.com/harvester/vm-import-controller/pkg/source"
+	"github.com/harvester/vm-import-controller/pkg/util"
 )
 
 type Client struct {
 	ctx context.Context
 	*govmomi.Client
-	tmpCerts string
-	dc       string
+	tmpCerts       string
+	dc             string
+	networkMapping map[string]string
 }
 
 func NewClient(ctx context.Context, endpoint string, dc string, secret *corev1.Secret) (*Client, error) {
 	var insecure bool
 	username, ok := secret.Data["username"]
 	if !ok {
-		return nil, fmt.Errorf("no key username found in secret %s", secret.Name)
+		return nil, fmt.Errorf("no key %q found in secret %s", "username", secret.Name)
 	}
 	password, ok := secret.Data["password"]
 	if !ok {
-		return nil, fmt.Errorf("no key password found in the secret %s", secret.Name)
+		return nil, fmt.Errorf("no key %q found in the secret %s", "password", secret.Name)
 	}
 
 	caCert, ok := secret.Data["caCert"]
@@ -91,35 +96,94 @@ func NewClient(ctx context.Context, endpoint string, dc string, secret *corev1.S
 	vmwareClient.ctx = ctx
 	vmwareClient.Client = c
 	vmwareClient.dc = dc
-	return vmwareClient, nil
 
+	networkMap, err := GenerateNetworkMapByRef(ctx, c.Client)
+	if err != nil {
+		return nil, fmt.Errorf("error generating network map during client initialisation: %w", err)
+	}
+	vmwareClient.networkMapping = networkMap
+
+	return vmwareClient, nil
 }
 
 func (c *Client) Close() error {
-	c.Client.CloseIdleConnections()
-	err := c.Client.Logout(c.ctx)
-	if err != nil {
-		return err
+	if c.Client != nil {
+		c.Client.CloseIdleConnections()
+		err := c.Client.Logout(c.ctx)
+		if err != nil {
+			return err
+		}
 	}
 	return os.Remove(c.tmpCerts)
 }
 
 // Verify checks is a verification check for migration provider to ensure that the config is valid
 // it is used to set the condition Ready on the migration provider.
-// for vmware client we verify if the DC exists
 func (c *Client) Verify() error {
+	// Verify if the DC exists.
 	f := find.NewFinder(c.Client.Client, true)
 	dc := c.dc
 	if !strings.HasPrefix(c.dc, "/") {
 		dc = fmt.Sprintf("/%s", c.dc)
 	}
-
 	dcObj, err := f.Datacenter(c.ctx, dc)
 	if err != nil {
 		return err
 	}
+	logrus.Infof("found dc: %v", dcObj)
+	return nil
+}
 
-	logrus.Infof("found dc :%v", dcObj)
+func (c *Client) PreFlightChecks(vm *migration.VirtualMachineImport) (err error) {
+	// Check the source network mappings.
+	networkMap, err := GenerateNetworkMapByName(c.ctx, c.Client.Client)
+	if err != nil {
+		return fmt.Errorf("error generating network map: %v", err)
+	}
+	for _, nm := range vm.Spec.Mapping {
+		logrus.WithFields(logrus.Fields{
+			"name":          vm.Name,
+			"namespace":     vm.Namespace,
+			"sourceNetwork": nm.SourceNetwork,
+		}).Info("Checking the source network as part of the preflight checks")
+
+		elements := strings.Split(nm.SourceNetwork, "/")
+		if _, ok := networkMap[elements[len(elements)-1]]; !ok {
+			return fmt.Errorf("source network '%s' not found", nm.SourceNetwork)
+		}
+	}
+
+	// If shutdown guest OS is requested (and power off is not forced), make
+	// sure that VMware tools are installed, otherwise shutdown will fail, and
+	// the import process will be stuck in an infinite loop.
+	if !vm.GetForcePowerOff() {
+		vmObj, err := c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
+		if err != nil {
+			return fmt.Errorf("failed to find VM: %w", err)
+		}
+
+		poweredOff, err := isPoweredOff(c.ctx, vmObj)
+		if err != nil {
+			return err
+		}
+
+		if !poweredOff {
+			logrus.WithFields(logrus.Fields{
+				"name":      vm.Name,
+				"namespace": vm.Namespace,
+			}).Info("Checking if VMware Tools is running as part of the preflight checks")
+
+			toolsRunning, err := vmObj.IsToolsRunning(c.ctx)
+			if err != nil {
+				return fmt.Errorf("failed to check if VMware Tools is running: %w", err)
+			}
+
+			if !toolsRunning {
+				return fmt.Errorf("cannot shutdown guest OS, VMware Tools is not running in the VM %s. Shut down the VM manually or use the 'spec.forcePowerOff' field", vm.Spec.VirtualMachineName)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -133,12 +197,12 @@ func (c *Client) ExportVirtualMachine(vm *migration.VirtualMachineImport) (err e
 	tmpPath, err = os.MkdirTemp("/tmp", fmt.Sprintf("%s-%s-", vm.Name, vm.Namespace))
 
 	if err != nil {
-		return fmt.Errorf("error creating tmp dir for vmexport: %v", err)
+		return fmt.Errorf("error creating tmp dir in ExportVirtualMachine: %v", err)
 	}
 
 	vmObj, err = c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
 	if err != nil {
-		return fmt.Errorf("error finding vm in ExportVirtualMacine: %v", err)
+		return fmt.Errorf("error finding vm in ExportVirtualMachine: %v", err)
 	}
 
 	lease, err = vmObj.Export(c.ctx)
@@ -152,35 +216,133 @@ func (c *Client) ExportVirtualMachine(vm *migration.VirtualMachineImport) (err e
 	}
 
 	u := lease.StartUpdater(c.ctx, info)
-	defer u.Done()
-	defer func() {
-		leaseErr := lease.Complete(c.ctx)
-		if leaseErr != nil {
-			if err == nil {
-				err = leaseErr
-			} else {
-				err = fmt.Errorf("err: %w, leaseErr: %v", err, leaseErr)
-			}
+	defer os.RemoveAll(tmpPath) //nolint:errcheck
+
+	logrus.WithFields(util.FieldsToJSON(logrus.Fields{
+		"name":      vm.Name,
+		"namespace": vm.Namespace,
+		"spec":      info.Items,
+	}, []string{"spec"})).Info("Origin spec of the volumes to be imported")
+
+	var vmMo mo.VirtualMachine
+	err = vmObj.Properties(c.ctx, vmObj.Reference(),
+		[]string{"config.hardware.device"},
+		&vmMo)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve VM hardware devices: %w", err)
+	}
+
+	diskByBusUnit := map[diskKey]*types.VirtualDisk{}
+	controllerBus := map[int32]int32{}
+
+	// by building this map, we can later match each lease disk entry to the corresponding
+	// VirtualDisk device in the VM hardware and retrieve the correct disk
+	// capacity from the VM configuration instead of relying on the incorrect LeaseInfo.Items[n].Size value.
+	for _, dev := range vmMo.Config.Hardware.Device {
+		if d, ok := dev.(types.BaseVirtualController); ok {
+			ctrl := d.GetVirtualController()
+			controllerBus[dev.GetVirtualDevice().Key] = ctrl.BusNumber
 		}
-	}()
+	}
+
+	// it's rare, but we cannot ensure the controller will always be before the disk in the list of devices
+	// so we need to loop through the devices twice to build a map of disks by their bus and unit numbers
+	for _, dev := range vmMo.Config.Hardware.Device {
+		if d, ok := dev.(*types.VirtualDisk); ok {
+			if d.UnitNumber == nil {
+				continue
+			}
+
+			bus, ok := controllerBus[d.ControllerKey]
+			if !ok {
+				logrus.WithFields(logrus.Fields{
+					"controllerKey": d.ControllerKey,
+					"diskKey":       d.Key,
+				}).Warn("Controller not found for disk")
+				continue
+			}
+
+			key := diskKey{
+				bus:  bus,
+				unit: *d.UnitNumber,
+			}
+			diskByBusUnit[key] = d
+		}
+	}
 
 	for _, i := range info.Items {
 		// ignore iso and nvram disks
 		if strings.HasSuffix(i.Path, ".vmdk") {
+			var diskSize int64
+
+			bus, unit, ok := parseDeviceId(i.DeviceId)
+			if ok {
+				if disk, ok := diskByBusUnit[diskKey{bus: bus, unit: unit}]; ok {
+					diskSize = disk.CapacityInKB * 1024
+				}
+			}
+
+			if diskSize == 0 {
+				// fallback to lease size if mapping failed
+				logrus.WithFields(logrus.Fields{
+					"name": vm.Name, "namespace": vm.Namespace,
+					"path":     i.Path,
+					"deviceId": i.DeviceId,
+					"size":     i.Size,
+				}).Warn("Failed to map lease VMDK to VirtualDisk capacity; falling back to lease item size")
+				diskSize = i.Size
+			}
+
 			if !strings.HasPrefix(i.Path, vm.Spec.VirtualMachineName) {
 				i.Path = vm.Name + "-" + vm.Namespace + "-" + i.Path
 			}
+
+			busType := detectDiskBusType(i.DeviceId, vm.GetDefaultDiskBusType())
+
+			logrus.WithFields(logrus.Fields{
+				"name":                    vm.Name,
+				"namespace":               vm.Namespace,
+				"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+				"spec.sourceCluster.name": vm.Spec.SourceCluster.Name,
+				"spec.sourceCluster.kind": vm.Spec.SourceCluster.Kind,
+				"deviceId":                i.DeviceId,
+				"path":                    i.Path,
+				"busType":                 busType,
+				"size":                    diskSize,
+			}).Info("Downloading an image")
 
 			exportPath := filepath.Join(tmpPath, i.Path)
 			err = lease.DownloadFile(c.ctx, exportPath, i, soap.DefaultDownload)
 			if err != nil {
 				return err
 			}
+
 			vm.Status.DiskImportStatus = append(vm.Status.DiskImportStatus, migration.DiskInfo{
 				Name:     i.Path,
-				DiskSize: i.Size,
+				DiskSize: diskSize,
+				BusType:  busType,
 			})
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"name":                    vm.Name,
+				"namespace":               vm.Namespace,
+				"spec.virtualMachineName": vm.Spec.VirtualMachineName,
+				"spec.sourceCluster.name": vm.Spec.SourceCluster.Name,
+				"spec.sourceCluster.kind": vm.Spec.SourceCluster.Kind,
+				"deviceId":                i.DeviceId,
+				"path":                    i.Path,
+				"size":                    i.Size,
+			}).Info("Skipping an image")
 		}
+	}
+
+	u.Done()
+	// complete lease since disks have been downloaded
+	// and all subsequence processing is local
+	// we ignore the error since we have the disks and can continue conversion
+	err = lease.Complete(c.ctx)
+	if err != nil {
+		logrus.Errorf("error marking lease complete: %v", err)
 	}
 
 	// disk info will name of disks including the format suffix ".vmdk"
@@ -195,27 +357,51 @@ func (c *Client) ExportVirtualMachine(vm *migration.VirtualMachineImport) (err e
 	// converted disks need to be placed in the server.TmpDir from where they will be served
 	for i, d := range vm.Status.DiskImportStatus {
 		sourceFile := filepath.Join(tmpPath, d.Name)
-		rawDiskName := strings.Split(d.Name, ".vmdk")[0] + ".img"
+		rawDiskName := util.BaseName(d.Name) + ".img"
 		destFile := filepath.Join(server.TempDir(), rawDiskName)
+
 		err = qemu.ConvertVMDKtoRAW(sourceFile, destFile)
 		if err != nil {
-			return err
+			return fmt.Errorf("error during conversion of VMDK to RAW disk: %v", err)
 		}
+
 		// update fields to reflect final location of raw image file
 		vm.Status.DiskImportStatus[i].DiskLocalPath = server.TempDir()
 		vm.Status.DiskImportStatus[i].Name = rawDiskName
-	}
 
-	return os.RemoveAll(tmpPath)
+		err := os.Remove(sourceFile)
+		if err != nil {
+			logrus.Errorf("Failed to remove VMDK file: %v", err)
+		}
+	}
+	return nil
 }
 
-func (c *Client) PowerOffVirtualMachine(vm *migration.VirtualMachineImport) error {
+func (c *Client) ShutdownGuest(vm *migration.VirtualMachineImport) error {
 	vmObj, err := c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
 	if err != nil {
-		return fmt.Errorf("error finding vm in PowerOffVirtualMachine: %v", err)
+		return fmt.Errorf("error finding VM in ShutdownGuest: %w", err)
 	}
 
-	ok, err := c.IsPoweredOff(vm)
+	ok, err := isPoweredOff(c.ctx, vmObj)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		return vmObj.ShutdownGuest(c.ctx)
+	}
+
+	return nil
+}
+
+func (c *Client) PowerOff(vm *migration.VirtualMachineImport) error {
+	vmObj, err := c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
+	if err != nil {
+		return fmt.Errorf("error finding VM in PowerOff: %w", err)
+	}
+
+	ok, err := isPoweredOff(c.ctx, vmObj)
 	if err != nil {
 		return err
 	}
@@ -228,32 +414,27 @@ func (c *Client) PowerOffVirtualMachine(vm *migration.VirtualMachineImport) erro
 	return nil
 }
 
+func (c *Client) IsPowerOffSupported() bool {
+	return true
+}
+
 func (c *Client) IsPoweredOff(vm *migration.VirtualMachineImport) (bool, error) {
 	vmObj, err := c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
 	if err != nil {
-		return false, fmt.Errorf("error find VM in IsPoweredOff :%v", err)
+		return false, fmt.Errorf("error find VM in IsPoweredOff: %v", err)
 	}
-
-	state, err := vmObj.PowerState(c.ctx)
-	if err != nil {
-		return false, fmt.Errorf("error looking up powerstate: %v", err)
-	}
-
-	if state == types.VirtualMachinePowerStatePoweredOff {
-		return true, nil
-	}
-
-	return false, nil
+	return isPoweredOff(c.ctx, vmObj)
 }
 
 func (c *Client) GenerateVirtualMachine(vm *migration.VirtualMachineImport) (*kubevirt.VirtualMachine, error) {
 	vmObj, err := c.findVM(vm.Spec.Folder, vm.Spec.VirtualMachineName)
 	if err != nil {
-		return nil, fmt.Errorf("error quering vm in GenerateVirtualMachine: %v", err)
+		return nil, fmt.Errorf("error querying vm in GenerateVirtualMachine: %w", err)
 	}
+
 	newVM := &kubevirt.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      vm.Spec.VirtualMachineName,
+			Name:      vm.Status.ImportedVirtualMachineName,
 			Namespace: vm.Namespace,
 		},
 	}
@@ -265,82 +446,37 @@ func (c *Client) GenerateVirtualMachine(vm *migration.VirtualMachineImport) (*ku
 		return nil, err
 	}
 
+	// Log the origin VM specification for better troubleshooting.
+	// Note, JSON is used to be able to prettify the output for better readability.
+	logrus.WithFields(util.FieldsToJSON(logrus.Fields{
+		"name":      vm.Name,
+		"namespace": vm.Namespace,
+		"spec":      o,
+	}, []string{"spec"})).Info("Origin spec of the VM to be imported")
+
 	// Need CPU, Socket, Memory, VirtualNIC information to perform the mapping
-	networkInfo := identifyNetworkCards(o.Config.Hardware.Device)
+	networkInfos := generateNetworkInfos(c.networkMapping, o.Config.Hardware.Device)
 
-	vmSpec := kubevirt.VirtualMachineSpec{
-		RunStrategy: &[]kubevirt.VirtualMachineRunStrategy{kubevirt.RunStrategyRerunOnFailure}[0],
-		Template: &kubevirt.VirtualMachineInstanceTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{
-					"harvesterhci.io/vmName": vm.Spec.VirtualMachineName,
-				},
-			},
-			Spec: kubevirt.VirtualMachineInstanceSpec{
-				Domain: kubevirt.DomainSpec{
-					CPU: &kubevirt.CPU{
-						Cores:   uint32(o.Config.Hardware.NumCPU),
-						Sockets: uint32(o.Config.Hardware.NumCoresPerSocket),
-						Threads: 1,
-					},
-					Memory: &kubevirt.Memory{
-						Guest: &[]resource.Quantity{resource.MustParse(fmt.Sprintf("%dM", o.Config.Hardware.MemoryMB))}[0],
-					},
-					Resources: kubevirt.ResourceRequirements{
-						Limits: corev1.ResourceList{
-							corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dM", o.Config.Hardware.MemoryMB)),
-							corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", o.Config.Hardware.NumCPU)),
-						},
-					},
-				},
-			},
+	vmSpec := source.NewVirtualMachineSpec(source.VirtualMachineSpecConfig{
+		Name: vm.Status.ImportedVirtualMachineName,
+		Hardware: source.Hardware{
+			NumCPU:            uint32(o.Config.Hardware.NumCPU),            // nolint:gosec
+			NumCoresPerSocket: uint32(o.Config.Hardware.NumCoresPerSocket), // nolint:gosec
+			MemoryMB:          int64(o.Config.Hardware.MemoryMB),
 		},
-	}
+	})
 
-	mappedNetwork := mapNetworkCards(networkInfo, vm.Spec.Mapping)
-	networkConfig := make([]kubevirt.Network, 0, len(mappedNetwork))
-	for i, v := range mappedNetwork {
-		networkConfig = append(networkConfig, kubevirt.Network{
-			NetworkSource: kubevirt.NetworkSource{
-				Multus: &kubevirt.MultusNetwork{
-					NetworkName: v.MappedNetwork,
-				},
-			},
-			Name: fmt.Sprintf("migrated-%d", i),
-		})
-	}
+	mappedNetwork := source.MapNetworks(networkInfos, vm.Spec.Mapping)
+	networkConfig, interfaceConfig := source.GenerateNetworkInterfaceConfigs(mappedNetwork, vm.GetDefaultNetworkInterfaceModel())
 
-	interfaces := make([]kubevirt.Interface, 0, len(mappedNetwork))
-	for i, v := range mappedNetwork {
-		interfaces = append(interfaces, kubevirt.Interface{
-			Name:       fmt.Sprintf("migrated-%d", i),
-			MacAddress: v.MAC,
-			Model:      "virtio",
-			InterfaceBindingMethod: kubevirt.InterfaceBindingMethod{
-				Bridge: &kubevirt.InterfaceBridge{},
-			},
-		})
-	}
-	// if there is no network, attach to Pod network. Essential for VM to be booted up
-	if len(networkConfig) == 0 {
-		networkConfig = append(networkConfig, kubevirt.Network{
-			Name: "pod-network",
-			NetworkSource: kubevirt.NetworkSource{
-				Pod: &kubevirt.PodNetwork{},
-			},
-		})
-		interfaces = append(interfaces, kubevirt.Interface{
-			Name:  "pod-network",
-			Model: "virtio",
-			InterfaceBindingMethod: kubevirt.InterfaceBindingMethod{
-				Masquerade: &kubevirt.InterfaceMasquerade{},
-			},
-		})
-	}
+	// Setup BIOS/EFI, SecureBoot and TPM settings.
+	fw := getFirmwareSettings(&o)
+	source.ApplyFirmwareSettings(vmSpec, fw)
 
 	vmSpec.Template.Spec.Networks = networkConfig
-	vmSpec.Template.Spec.Domain.Devices.Interfaces = interfaces
-	newVM.Spec = vmSpec
+	vmSpec.Template.Spec.Domain.Devices.Interfaces = interfaceConfig
+	newVM.Spec = *vmSpec
+
 	// disk attachment needs query by core controller for storage classes, so will be added by the migration controller
 	return newVM, nil
 }
@@ -355,62 +491,315 @@ func (c *Client) findVM(path, name string) (*object.VirtualMachine, error) {
 	return f.VirtualMachine(c.ctx, vmPath)
 }
 
-type networkInfo struct {
-	NetworkName   string
-	MAC           string
-	MappedNetwork string
-}
+func generateNetworkInfos(networkMap map[string]string, devices []types.BaseVirtualDevice) []source.NetworkInfo {
+	result := make([]source.NetworkInfo, 0, len(devices))
 
-func identifyNetworkCards(devices []types.BaseVirtualDevice) []networkInfo {
-	var resp []networkInfo
 	for _, d := range devices {
 		switch d := d.(type) {
 		case *types.VirtualVmxnet:
 			obj := d
-			resp = append(resp, networkInfo{
-				NetworkName: obj.DeviceInfo.GetDescription().Summary,
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
 				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelVirtio,
 			})
 		case *types.VirtualE1000e:
 			obj := d
-			resp = append(resp, networkInfo{
-				NetworkName: obj.DeviceInfo.GetDescription().Summary,
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
 				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelE1000e,
 			})
 		case *types.VirtualE1000:
 			obj := d
-			resp = append(resp, networkInfo{
-				NetworkName: obj.DeviceInfo.GetDescription().Summary,
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
 				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelE1000,
 			})
 		case *types.VirtualVmxnet3:
 			obj := d
-			resp = append(resp, networkInfo{
-				NetworkName: obj.DeviceInfo.GetDescription().Summary,
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
 				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelVirtio,
 			})
 		case *types.VirtualVmxnet2:
 			obj := d
-			resp = append(resp, networkInfo{
-				NetworkName: obj.DeviceInfo.GetDescription().Summary,
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
 				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelVirtio,
+			})
+		case *types.VirtualPCNet32:
+			obj := d
+			summary := identifyNetworkName(networkMap, *obj.GetVirtualDevice())
+			if summary == "" {
+				summary = obj.DeviceInfo.GetDescription().Summary
+			}
+			result = append(result, source.NetworkInfo{
+				NetworkName: summary,
+				MAC:         obj.MacAddress,
+				Model:       migration.NetworkInterfaceModelPcnet,
 			})
 		}
 	}
 
-	return resp
+	return result
 }
 
-func mapNetworkCards(networkCards []networkInfo, mapping []migration.NetworkMapping) []networkInfo {
-	var retNetwork []networkInfo
-	for _, nc := range networkCards {
-		for _, m := range mapping {
-			if m.SourceNetwork == nc.NetworkName {
-				nc.MappedNetwork = m.DestinationNetwork
-				retNetwork = append(retNetwork, nc)
-			}
-		}
+// detectDiskBusType tries to identify the disk bus type from VMware to attempt and
+// set correct bus types in KubeVirt. Defaults to the specified bus type in `def`
+// if auto-detection fails.
+// Examples:
+// .--------------------------------------------------.
+// | Bus  | Device ID                                 |
+// |------|-------------------------------------------|
+// | SCSI | /vm-13010/ParaVirtualSCSIController0:0    |
+// | SCSI | /vm-13011/VirtualBusLogicController0:0    |
+// | SCSI | /vm-13012/VirtualLsiLogicController0:0    |
+// | SCSI | /vm-13013/VirtualLsiLogicSASController0:0 |
+// | SATA | /vm-13767/VirtualAHCIController0:1        |
+// | IDE  | /vm-5678/VirtualIDEController1:0          |
+// | NVMe | /vm-2468/VirtualNVMEController0:0         |
+// | USB  | /vm-54321/VirtualUSBController0:0         |
+// '--------------------------------------------------'
+// References:
+// - https://github.com/vmware/pyvmomi/tree/master/pyVmomi/vim/vm/device
+// - https://vdc-download.vmware.com/vmwb-repository/dcr-public/d1902b0e-d479-46bf-8ac9-cee0e31e8ec0/07ce8dbd-db48-4261-9b8f-c6d3ad8ba472/vim.vm.device.VirtualSCSIController.html
+// - https://libvirt.org/formatdomain.html#controllers
+// - https://kubevirt.io/api-reference/v1.1.0/definitions.html#_v1_disktarget
+func detectDiskBusType(deviceID string, def kubevirt.DiskBus) kubevirt.DiskBus {
+	deviceID = strings.ToLower(deviceID)
+	switch {
+	case strings.Contains(deviceID, "paravirtualscsi"):
+		// The pvscsi (Paravirtual SCSI) controller cannot be mapped to
+		// SCSI bus type because in KubeVirt it is not possible to specify
+		// the exact model (pvscsi, lsilogic, ...) of the disk via the
+		// VirtualMachine API. Attempting to map pvscsi to SCSI prevents
+		// the VM from booting.
+		// As a workaround, the SATA bus type is utilized in such case.
+		// Note, VirtIO would be better, but it is not said that the
+		// required drivers are installed in the VM.
+		return kubevirt.DiskBusSATA
+	case strings.Contains(deviceID, "scsi"), strings.Contains(deviceID, "buslogic"), strings.Contains(deviceID, "lsilogic"):
+		return kubevirt.DiskBusSCSI
+	case strings.Contains(deviceID, "ahci"), strings.Contains(deviceID, "sata"), strings.Contains(deviceID, "ide"):
+		return kubevirt.DiskBusSATA
+	case strings.Contains(deviceID, "nvme"):
+		return kubevirt.DiskBusVirtio
+	case strings.Contains(deviceID, "usb"):
+		return kubevirt.DiskBusUSB
+	default:
+		return def
+	}
+}
+
+// SanitizeVirtualMachineImport is used to sanitize the VirtualMachineImport object.
+func (c *Client) SanitizeVirtualMachineImport(vm *migration.VirtualMachineImport) error {
+	// Note, VMware allows upper case characters in virtual machine names,
+	// so we need to convert them to lower case to be RFC 1123 compliant.
+	vm.Status.ImportedVirtualMachineName = strings.ToLower(vm.Spec.VirtualMachineName)
+
+	return nil
+}
+
+func (c *Client) Cleanup(vm *migration.VirtualMachineImport) error {
+	return source.RemoveTempImageFiles(vm.Status.DiskImportStatus)
+}
+
+// GenerateNetworkMapByRef lists all networks defined in the DC and converts them to
+// network id: network name
+// this subsequently used to map a network id to network name if needed based on the type
+// of backing device for a nic
+func GenerateNetworkMapByRef(ctx context.Context, c *vim25.Client) (map[string]string, error) {
+	networks, err := generateNetworkList(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	returnMap := make(map[string]string, len(networks))
+	for _, v := range networks {
+		returnMap[v.Reference().Value] = v.Name
+	}
+	logrus.Debugf("generated networkMapByRef: %v", returnMap)
+	return returnMap, nil
+}
+
+func GenerateNetworkMapByName(ctx context.Context, c *vim25.Client) (map[string]string, error) {
+	networks, err := generateNetworkList(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	returnMap := make(map[string]string, len(networks))
+	for _, v := range networks {
+		returnMap[v.Name] = v.Reference().Value
+	}
+	logrus.Debugf("generated networkMapByName: %v", returnMap)
+	return returnMap, nil
+}
+
+func generateNetworkList(ctx context.Context, c *vim25.Client) ([]mo.Network, error) {
+	var networks []mo.Network
+	manager := view.NewManager(c)
+	networkView, err := manager.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"Network"}, true)
+	if err != nil {
+		return networks, fmt.Errorf("error generating network container view: %v", err)
+	}
+	defer networkView.Destroy(ctx) //nolint:errcheck
+	if err := networkView.Retrieve(ctx, []string{"Network"}, nil, &networks); err != nil {
+		return networks, fmt.Errorf("error retreiving networks: %v", err)
+	}
+	return networks, nil
+}
+
+// identifyNetworkName uses the backing device for a nic to identify network name correctly
+// in case of a nic using a Distributed VSwitch the summary returned from device is of the form
+// DVSwitch : HEX NUMBER which breaks network lookup. As a result we need to identify the network name
+// from the PortGroupKey
+func identifyNetworkName(networkMap map[string]string, device types.VirtualDevice) string {
+	var summary string
+	backing := device.Backing
+	switch b := backing.(type) {
+	case *types.VirtualEthernetCardDistributedVirtualPortBackingInfo:
+		obj := b
+		logrus.Debugf("looking up portgroupkey: %v", obj.Port.PortgroupKey)
+		summary = networkMap[obj.Port.PortgroupKey]
+	case *types.VirtualEthernetCardNetworkBackingInfo:
+		obj := b
+		logrus.Debugf("using devicename: %v", obj.DeviceName)
+		summary = obj.DeviceName
+	default:
+		summary = ""
+	}
+	return summary
+}
+
+func (c *Client) ListNetworks() error {
+	mgr := view.NewManager(c.Client.Client)
+
+	v, err := mgr.CreateContainerView(c.ctx, c.ServiceContent.RootFolder, []string{"Network"}, true)
+	if err != nil {
+		return fmt.Errorf("error creating view %v", err)
 	}
 
-	return retNetwork
+	defer v.Destroy(c.ctx) //nolint:errcheck
+	var networks []mo.Network
+	err = v.Retrieve(c.ctx, []string{"Network"}, nil, &networks)
+	if err != nil {
+		return fmt.Errorf("error fetching networks: %v", err)
+	}
+
+	for _, net := range networks {
+		fmt.Printf("%s: %s\n", net.Name, net.Reference())
+	}
+
+	return nil
+}
+
+// isPoweredOff checks if the given VM is powered off.
+func isPoweredOff(ctx context.Context, vm *object.VirtualMachine) (bool, error) {
+	state, err := vm.PowerState(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to get power state: %w", err)
+	}
+	return state == types.VirtualMachinePowerStatePoweredOff, nil
+}
+
+func getFirmwareSettings(o *mo.VirtualMachine) *source.Firmware {
+	fw := source.NewFirmware(false, false, false)
+
+	fw.UEFI = strings.EqualFold(o.Config.Firmware, string(types.GuestOsDescriptorFirmwareTypeEfi))
+	if o.Config.BootOptions != nil {
+		fw.SecureBoot = ptr.Deref(o.Config.BootOptions.EfiSecureBootEnabled, false)
+	}
+	fw.TPM = ptr.Deref(o.Summary.Config.TpmPresent, false)
+
+	return fw
+}
+
+// diskKey uniquely identifies a disk in the VM hardware topology
+// using the (controller bus, unit) address.
+type diskKey struct {
+	bus  int32
+	unit int32
+}
+
+// parseDeviceId extracts the controller bus number and unit number from an
+// OVF HttpNfcLease DeviceId.
+//
+// In VMware OVF exports, each disk file in HttpNfcLeaseInfo.Items contains a
+// DeviceId string identifying the virtual device. The format typically looks like:
+//
+//	/vm-13010/VirtualSCSIController0:0
+//
+// or sometimes simply:
+//
+//	scsi0:0
+//
+// The format can be generalized as:
+//
+//	[optional path]/<controller><bus>:<unit>
+//
+// Examples:
+//
+//	/vm-13010/VirtualSCSIController0:0  -> bus=0, unit=0
+//	/vm-13010/VirtualNVMEController1:2  -> bus=1, unit=2
+//	scsi0:1                            -> bus=0, unit=1
+//
+// The controller prefix may vary (SCSI, NVME, AHCI, IDE, etc.).
+// Only the trailing digits before ":" represent the bus number.
+//
+// This function extracts the last path segment and parses the bus and unit
+// numbers without relying on regex.
+func parseDeviceId(deviceId string) (bus int32, unit int32, ok bool) {
+	if idx := strings.LastIndex(deviceId, "/"); idx >= 0 {
+		deviceId = deviceId[idx+1:]
+	}
+
+	colon := strings.Split(deviceId, ":")
+	if len(colon) != 2 {
+		return
+	}
+
+	unit64, err := strconv.ParseInt(colon[1], 10, 32)
+	if err != nil {
+		return
+	}
+
+	// find trailing digits for bus number
+	i := len(colon[0]) - 1
+	for i >= 0 && colon[0][i] >= '0' && colon[0][i] <= '9' {
+		i--
+	}
+
+	if i == len(colon[0])-1 {
+		return
+	}
+
+	bus64, err := strconv.ParseInt(colon[0][i+1:], 10, 32)
+	if err != nil {
+		return
+	}
+
+	return int32(bus64), int32(unit64), true
 }

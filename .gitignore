@@ -3,6 +3,8 @@
 /.cache
 /bin
 /dist
+/scripts/.version_env
 *.swp
 .idea
 *.DS_Store
+.env

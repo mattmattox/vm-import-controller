@@ -3,8 +3,14 @@ package v1beta1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/harvester/vm-import-controller/pkg/apis/common"
+)
+
+const (
+	OpenstackDefaultRetryCount = 30
+	OpenstackDefaultRetryDelay = 10
 )
 
 // +genclient
@@ -18,9 +24,10 @@ type OpenstackSource struct {
 }
 
 type OpenstackSourceSpec struct {
-	EndpointAddress string                 `json:"endpoint"`
-	Region          string                 `json:"region"`
-	Credentials     corev1.SecretReference `json:"credentials"`
+	EndpointAddress        string                 `json:"endpoint"`
+	Region                 string                 `json:"region"`
+	Credentials            corev1.SecretReference `json:"credentials"`
+	OpenstackSourceOptions `json:",inline"`
 }
 
 type OpenstackSourceStatus struct {
@@ -29,18 +36,51 @@ type OpenstackSourceStatus struct {
 	Conditions []common.Condition `json:"conditions,omitempty"`
 }
 
-func (o *OpenstackSource) ClusterStatus() ClusterStatus {
-	return o.Status.Status
+type OpenstackSourceOptions struct {
+	// +optional
+	// The number of max. retries for uploading an image.
+	UploadImageRetryCount int `json:"uploadImageRetryCount,omitempty"`
+	// +optional
+	// The upload retry delay in seconds.
+	UploadImageRetryDelay int `json:"uploadImageRetryDelay,omitempty"`
 }
 
-func (o *OpenstackSource) SecretReference() corev1.SecretReference {
-	return o.Spec.Credentials
+func (s *OpenstackSource) NamespacedName() string {
+	return types.NamespacedName{
+		Namespace: s.Namespace,
+		Name:      s.Name,
+	}.String()
 }
 
-func (o *OpenstackSource) GetKind() string {
-	return "openstacksource"
+func (s *OpenstackSource) ClusterStatus() ClusterStatus {
+	return s.Status.Status
 }
 
-func (o *OpenstackSource) GetConnectionInfo() (string, string) {
-	return o.Spec.EndpointAddress, o.Spec.Region
+func (s *OpenstackSource) HasSecret() bool {
+	return true
+}
+
+func (s *OpenstackSource) SecretReference() *corev1.SecretReference {
+	return &s.Spec.Credentials
+}
+
+func (s *OpenstackSource) GetKind() string {
+	return KindOpenstackSource
+}
+
+func (s *OpenstackSource) GetConnectionInfo() (string, string) {
+	return s.Spec.EndpointAddress, s.Spec.Region
+}
+
+// GetOptions returns the sanitized OpenstackSourceOptions. This means
+// optional values are set to their default values.
+func (s *OpenstackSource) GetOptions() interface{} {
+	options := s.Spec.OpenstackSourceOptions
+	if options.UploadImageRetryCount <= 0 {
+		options.UploadImageRetryCount = OpenstackDefaultRetryCount
+	}
+	if options.UploadImageRetryDelay <= 0 {
+		options.UploadImageRetryDelay = OpenstackDefaultRetryDelay
+	}
+	return options
 }

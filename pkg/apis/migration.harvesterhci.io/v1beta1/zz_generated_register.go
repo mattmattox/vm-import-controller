@@ -1,5 +1,5 @@
 /*
-Copyright 2022 Rancher Labs, Inc.
+Copyright 2026 SUSE, LLC.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import (
 
 var (
 	OpenstackSourceResourceName      = "openstacksources"
+	OvaSourceResourceName            = "ovasources"
 	VirtualMachineImportResourceName = "virtualmachineimports"
 	VmwareSourceResourceName         = "vmwaresources"
 )
@@ -56,6 +57,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(SchemeGroupVersion,
 		&OpenstackSource{},
 		&OpenstackSourceList{},
+		&OvaSource{},
+		&OvaSourceList{},
 		&VirtualMachineImport{},
 		&VirtualMachineImportList{},
 		&VmwareSource{},

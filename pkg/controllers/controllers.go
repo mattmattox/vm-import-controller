@@ -5,12 +5,14 @@ import (
 	"time"
 
 	harvester "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io"
+	cniv1 "github.com/harvester/harvester/pkg/generated/controllers/k8s.cni.cncf.io"
 	"github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io"
 	"github.com/rancher/lasso/pkg/cache"
 	"github.com/rancher/lasso/pkg/client"
 	"github.com/rancher/lasso/pkg/controller"
-	"github.com/rancher/wrangler/pkg/generated/controllers/core"
-	"github.com/rancher/wrangler/pkg/start"
+	"github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
+	"github.com/rancher/wrangler/v3/pkg/generated/controllers/storage"
+	"github.com/rancher/wrangler/v3/pkg/start"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
 
@@ -46,10 +48,6 @@ func Register(ctx context.Context, restConfig *rest.Config) error {
 		DefaultWorkers:     5,
 	})
 
-	if err != nil {
-		return err
-	}
-
 	migrationFactory, err := migration.NewFactoryFromConfigWithOptions(restConfig, &migration.FactoryOptions{
 		SharedControllerFactory: scf,
 	})
@@ -74,18 +72,35 @@ func Register(ctx context.Context, restConfig *rest.Config) error {
 
 	kubevirtFactory, err := kubevirt.NewFactoryFromConfigWithOptions(restConfig, &kubevirt.FactoryOptions{
 		SharedControllerFactory: scf,
+		SharedCacheFactory:      cacheFactory,
 	})
 	if err != nil {
 		return err
 	}
 
-	sc.RegisterVmareController(ctx, migrationFactory.Migration().V1beta1().VmwareSource(), coreFactory.Core().V1().Secret())
+	storageFactory, err := storage.NewFactoryFromConfigWithOptions(restConfig, &core.FactoryOptions{
+		SharedControllerFactory: scf,
+	})
+	if err != nil {
+		return err
+	}
+
+	scCache := storageFactory.Storage().V1().StorageClass().Cache()
+
+	cniFactory, err := cniv1.NewFactoryFromConfigWithOptions(restConfig, &core.FactoryOptions{
+		SharedControllerFactory: scf,
+	})
+	if err != nil {
+		return err
+	}
+
+	sc.RegisterVmwareController(ctx, migrationFactory.Migration().V1beta1().VmwareSource(), coreFactory.Core().V1().Secret())
+	sc.RegisterOvaController(ctx, migrationFactory.Migration().V1beta1().OvaSource(), coreFactory.Core().V1().Secret())
 	sc.RegisterOpenstackController(ctx, migrationFactory.Migration().V1beta1().OpenstackSource(), coreFactory.Core().V1().Secret())
-
 	sc.RegisterVMImportController(ctx, migrationFactory.Migration().V1beta1().VmwareSource(), migrationFactory.Migration().V1beta1().OpenstackSource(),
-		coreFactory.Core().V1().Secret(), migrationFactory.Migration().V1beta1().VirtualMachineImport(),
+		migrationFactory.Migration().V1beta1().OvaSource(), coreFactory.Core().V1().Secret(), migrationFactory.Migration().V1beta1().VirtualMachineImport(),
 		harvesterFactory.Harvesterhci().V1beta1().VirtualMachineImage(), kubevirtFactory.Kubevirt().V1().VirtualMachine(),
-		coreFactory.Core().V1().PersistentVolumeClaim())
+		coreFactory.Core().V1().PersistentVolumeClaim(), scCache, cniFactory.K8s().V1().NetworkAttachmentDefinition().Cache())
 
-	return start.All(ctx, 1, migrationFactory)
+	return start.All(ctx, 1, migrationFactory, coreFactory, harvesterFactory, kubevirtFactory, storageFactory, cniFactory)
 }
